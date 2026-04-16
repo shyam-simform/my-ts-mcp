@@ -1,0 +1,13 @@
+{
+	"servers": {
+		"ubuntu-assistant": {
+			"type": "stdio",
+			"command": "npx",
+			"args": [
+				"tsx",
+				"${workspaceFolder}/src/server.ts"
+			]
+		},
+	},
+	"inputs": []
+}
