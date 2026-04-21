@@ -16,6 +16,7 @@ const DATA_DIR = process.env.HOME + "/Documents/mcp-data";
 const TASKS_FILE = join(DATA_DIR, "tasks.json");
 const NOTES_FILE = join(DATA_DIR, "notes.json");
 const STANDUPS_FILE = join(DATA_DIR, "standups.json");
+const LEARNING_FILE = join(DATA_DIR, "learning.json");
 
 // ─── Helper: load / save JSON safely ────────────────────────────────────────
 function loadJson<T>(path: string, fallback: T): T {
@@ -39,6 +40,15 @@ interface Note {
   id: number;
   title: string;
   body: string;
+  createdAt: string;
+}
+interface LearningEntry {
+  id: number;
+  date: string;
+  topic: string;
+  resource: string;
+  duration: number;
+  notes: string;
   createdAt: string;
 }
 interface Standup {
@@ -528,6 +538,330 @@ ${rawSummary}`;
 
     return {
       content: [{ type: "text", text: enhanced }],
+    };
+  },
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOOL 10 — Send work update to Microsoft Teams
+// ════════════════════════════════════════════════════════════════════════════
+server.tool(
+  "send_to_teams",
+  "Send today's work update to your Microsoft Teams channel via webhook",
+  {
+    date: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .optional()
+      .describe("Date in YYYY-MM-DD format (default: today)"),
+  },
+  async ({ date }) => {
+    const webhookUrl = process.env.TEAMS_WEBHOOK_URL;
+    if (!webhookUrl || webhookUrl === "your-teams-webhook-url-here") {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        "TEAMS_WEBHOOK_URL is not set in your .env file. Add it to start sending to Teams.",
+      );
+    }
+
+    const target = date ?? new Date().toISOString().slice(0, 10);
+    const standups = loadJson<Standup[]>(STANDUPS_FILE, []);
+    const entry = standups.find((s) => s.date === target);
+
+    if (!entry) {
+      return {
+        content: [{ type: "text", text: `No work update found for ${target}. Use save_work_update first.` }],
+      };
+    }
+
+    const todayWorkList = entry.todayWork.map((t) => `• ${t}`).join("\n");
+    const nextDayPlanList = entry.nextDayPlan.map((t) => `• ${t}`).join("\n");
+
+    const prompt = `You are a work update formatter for Microsoft Teams. Rewrite the bullets to be clear and professional, then output in EXACTLY this format — no extra text, no introduction:
+
+📋 **Daily Work Update — ${entry.date}**
+
+✅ **Today's Work:**
+[rewritten bullets]
+
+🚀 **Next Day Plan:**
+[rewritten bullets]
+
+🚧 **Blockers:** [blocker text]
+
+💪 [one short motivational closing line]
+
+Rules:
+- Use simple plain English. No fancy words.
+- Keep the exact headers and emojis.
+- NEVER change the nature of the task (learning stays learning).
+- Each bullet starts with a simple action verb.
+- Blockers stays on one line.
+
+Raw data:
+Today's Work:
+${todayWorkList}
+
+Next Day Plan:
+${nextDayPlanList}
+
+Blockers: ${entry.blockers}`;
+
+    const aiResponse = await groq.chat.completions.create({
+      model: "llama-3.1-8b-instant",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 1024,
+      temperature: 0.3,
+    });
+
+    const message =
+      aiResponse.choices[0]?.message?.content?.trim() ||
+      `📋 **Daily Work Update — ${entry.date}**\n\n✅ **Today's Work:**\n${todayWorkList}\n\n🚀 **Next Day Plan:**\n${nextDayPlanList}\n\n🚧 **Blockers:** ${entry.blockers}`;
+
+    // Power Automate (Workflows) webhook expects a simple JSON body
+    const teamsPayload = {
+      message,
+    };
+
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(teamsPayload),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to send to Teams: ${response.status} ${response.statusText} — ${body}`,
+      );
+    }
+
+    return {
+      content: [{ type: "text", text: `✅ Work update for ${entry.date} sent to your Teams channel successfully!` }],
+    };
+  },
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOOL 11 — Log a learning session
+// ════════════════════════════════════════════════════════════════════════════
+server.tool(
+  "log_learning",
+  "Log a learning session with topic, resource, duration and notes",
+  {
+    topic: z.string().min(1).describe("What you are learning (e.g. MCP, TypeScript, React)"),
+    resource: z.string().min(1).describe("Resource used (e.g. YouTube, Docs, Book, Course, Article)"),
+    duration: z.number().int().min(1).describe("Time spent in minutes"),
+    notes: z.string().min(1).describe("What you learned or key takeaways"),
+    date: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be in YYYY-MM-DD format")
+      .optional()
+      .describe("Date in YYYY-MM-DD format (default: today)"),
+  },
+  async ({ topic, resource, duration, notes, date: inputDate }) => {
+    const entries = loadJson<LearningEntry[]>(LEARNING_FILE, []);
+    const date = inputDate ?? new Date().toISOString().slice(0, 10);
+    const entry: LearningEntry = {
+      id: Date.now(),
+      date,
+      topic,
+      resource,
+      duration,
+      notes,
+      createdAt: new Date().toISOString(),
+    };
+    entries.push(entry);
+    saveJson(LEARNING_FILE, entries);
+    return {
+      content: [{ type: "text", text: `✅ Logged ${duration} min of learning on "${topic}" from ${resource}.` }],
+    };
+  },
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOOL 11 — Get learning summary (AI-enhanced)
+// ════════════════════════════════════════════════════════════════════════════
+server.tool(
+  "get_learning_summary",
+  "Get an AI-enhanced summary of your learning sessions for today or a specific date",
+  {
+    date: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .optional()
+      .describe("Date in YYYY-MM-DD format (default: today)"),
+  },
+  async ({ date }) => {
+    const target = date ?? new Date().toISOString().slice(0, 10);
+    const entries = loadJson<LearningEntry[]>(LEARNING_FILE, []);
+    const dayEntries = entries.filter((e) => e.date === target);
+
+    if (dayEntries.length === 0) {
+      return {
+        content: [{ type: "text", text: `No learning sessions found for ${target}. Use log_learning to add one.` }],
+      };
+    }
+
+    const totalMins = dayEntries.reduce((sum, e) => sum + e.duration, 0);
+    const rawData = dayEntries
+      .map((e) => `Topic: ${e.topic}\nResource: ${e.resource}\nDuration: ${e.duration} min\nNotes: ${e.notes}`)
+      .join("\n\n");
+
+    const prompt = `You are a learning journal formatter. Format the learning sessions below in EXACTLY this format — no extra text, no introduction, nothing else:
+
+📚 *Learning Summary — ${target}*
+⏱ *Total Time:* ${totalMins} min
+
+[For each session:]
+🎯 *[topic]*
+  📖 Resource: [resource]
+  ⏱ Duration: [duration] min
+  💡 Key Takeaway: [rewrite notes as one clear, simple sentence in plain English]
+
+─────────────────────────────
+🧠 *What You Learned Today:* [2-3 sentence AI summary of all sessions combined, in simple plain English]
+💪 *Keep it up!* [one short encouraging line]
+
+Rules:
+- Output ONLY the formatted summary. No preamble.
+- Use simple, plain English. Avoid fancy words.
+- Keep the exact headers and emojis.
+- "Key Takeaway" must be one clear sentence a beginner can understand.
+
+Raw data:
+${rawData}`;
+
+    const aiResponse = await groq.chat.completions.create({
+      model: "llama-3.1-8b-instant",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 1024,
+      temperature: 0.3,
+    });
+
+    const fallback = `📚 *Learning Summary — ${target}*\n⏱ *Total Time:* ${totalMins} min\n\n` +
+      dayEntries.map((e) => `🎯 *${e.topic}*\n  📖 ${e.resource} — ${e.duration} min\n  💡 ${e.notes}`).join("\n\n");
+
+    const enhanced = aiResponse.choices[0]?.message?.content?.trim() || fallback;
+    return {
+      content: [{ type: "text", text: enhanced }],
+    };
+  },
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOOL 12 — List all learning topics (AI-enhanced)
+// ════════════════════════════════════════════════════════════════════════════
+server.tool(
+  "list_learning_topics",
+  "List all topics you have learned with total time spent and an AI-generated progress insight",
+  {
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(50)
+      .default(10)
+      .describe("Number of recent topics to show (default: 10)"),
+  },
+  async ({ limit }) => {
+    const entries = loadJson<LearningEntry[]>(LEARNING_FILE, []);
+
+    if (entries.length === 0) {
+      return {
+        content: [{ type: "text", text: "No learning sessions logged yet. Use log_learning to start tracking." }],
+      };
+    }
+
+    const topicMap = new Map<string, { totalMins: number; sessions: number; lastDate: string }>();
+    for (const e of entries) {
+      const existing = topicMap.get(e.topic);
+      if (existing) {
+        existing.totalMins += e.duration;
+        existing.sessions += 1;
+        if (e.date > existing.lastDate) existing.lastDate = e.date;
+      } else {
+        topicMap.set(e.topic, { totalMins: e.duration, sessions: 1, lastDate: e.date });
+      }
+    }
+
+    const topics = [...topicMap.entries()]
+      .sort((a, b) => b[1].lastDate.localeCompare(a[1].lastDate))
+      .slice(0, limit);
+
+    const rawData = topics
+      .map(([topic, s]) => `Topic: ${topic} | Total: ${s.totalMins} min | Sessions: ${s.sessions} | Last studied: ${s.lastDate}`)
+      .join("\n");
+
+    const prompt = `You are a learning progress formatter. Format the topic list in EXACTLY this format — no extra text, no introduction, nothing else:
+
+📊 *Your Learning Topics*
+─────────────────────────────
+[For each topic:]
+📌 *[topic]*
+  ⏱ Total Time: [X] min  |  🔁 Sessions: [N]  |  📅 Last Studied: [date]
+  📈 Progress: [one short plain English sentence about this topic's progress]
+
+─────────────────────────────
+🧠 *Overall Insight:* [one plain English sentence about the overall learning pattern]
+
+Rules:
+- Output ONLY the formatted list. No preamble.
+- Use simple, plain English.
+- Keep exact headers and emojis.
+
+Raw data:
+${rawData}`;
+
+    const aiResponse = await groq.chat.completions.create({
+      model: "llama-3.1-8b-instant",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 1024,
+      temperature: 0.3,
+    });
+
+    const fallback = `📊 *Your Learning Topics*\n\n` +
+      topics.map(([topic, s]) => `📌 *${topic}* — ${s.totalMins} min across ${s.sessions} session(s), last on ${s.lastDate}`).join("\n");
+
+    const enhanced = aiResponse.choices[0]?.message?.content?.trim() || fallback;
+    return {
+      content: [{ type: "text", text: enhanced }],
+    };
+  },
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOOL 13 — Search learning notes
+// ════════════════════════════════════════════════════════════════════════════
+server.tool(
+  "search_learning",
+  "Search your learning notes by topic or keyword",
+  {
+    query: z.string().min(1).describe("Keyword or topic to search for"),
+  },
+  async ({ query }) => {
+    const entries = loadJson<LearningEntry[]>(LEARNING_FILE, []);
+    const q = query.toLowerCase();
+    const matches = entries.filter(
+      (e) =>
+        e.topic.toLowerCase().includes(q) ||
+        e.notes.toLowerCase().includes(q) ||
+        e.resource.toLowerCase().includes(q),
+    );
+
+    if (matches.length === 0) {
+      return {
+        content: [{ type: "text", text: `No learning sessions found matching "${query}".` }],
+      };
+    }
+
+    const lines = matches
+      .sort((a, b) => b.date.localeCompare(a.date))
+      .map((e) => `📅 ${e.date} | 🎯 ${e.topic} | 📖 ${e.resource} | ⏱ ${e.duration} min\n   💡 ${e.notes}`);
+
+    return {
+      content: [{ type: "text", text: `Found ${matches.length} session(s) for "${query}":\n\n${lines.join("\n\n")}` }],
     };
   },
 );
