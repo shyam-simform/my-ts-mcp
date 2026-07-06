@@ -10,7 +10,12 @@
   "scripts": {
     "build": "tsc",
     "dev": "DANGEROUSLY_OMIT_AUTH=true npx @modelcontextprotocol/inspector tsx --env-file=.env src/server.ts",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "client:connect": "tsx --env-file=.env src/client/01-connect.ts",
+    "client:tools": "tsx --env-file=.env src/client/02-call-tool.ts",
+    "client:resources": "tsx --env-file=.env src/client/03-resources.ts",
+    "client:prompts": "tsx --env-file=.env src/client/04-prompts.ts",
+    "client:chat": "tsx --env-file=.env src/client/05-chatbot.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

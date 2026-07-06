@@ -618,9 +618,10 @@ Blockers: ${entry.blockers}`;
       aiResponse.choices[0]?.message?.content?.trim() ||
       `📋 **Daily Work Update — ${entry.date}**\n\n✅ **Today's Work:**\n${todayWorkList}\n\n🚀 **Next Day Plan:**\n${nextDayPlanList}\n\n🚧 **Blockers:** ${entry.blockers}`;
 
-    // Power Automate (Workflows) webhook expects a simple JSON body
+    // Make.com webhook — sends plain JSON, Make.com posts it to Teams
     const teamsPayload = {
       message,
+      date: entry.date,
     };
 
     const response = await fetch(webhookUrl, {
@@ -888,6 +889,63 @@ server.resource(
       ],
     };
   },
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// PROMPT — Work update formatter
+//
+// MCP has three primitives: tools (model-invoked actions), resources
+// (host-readable data), and prompts (reusable, user/host-triggered message
+// templates). This is the third one. Unlike a tool, a prompt is never called
+// automatically by the model mid-conversation — a *user* (or a client acting
+// on their behalf) explicitly selects it, arguments get filled in, and the
+// result is a ready-made list of chat messages that gets dropped straight
+// into the conversation. Here we turn the same "make this standup update
+// sound professional" instruction that get_work_update hardcodes into a
+// reusable template any MCP client can fetch via prompts/list + prompts/get.
+// ════════════════════════════════════════════════════════════════════════════
+server.registerPrompt(
+  "work_update_prompt",
+  {
+    title: "Format a work update",
+    description:
+      "Turn raw standup bullets into a professional, Teams-ready work update message",
+    argsSchema: {
+      today_work: z.string().describe("Today's work, one item per line"),
+      next_day_plan: z.string().describe("Tomorrow's plan, one item per line"),
+      blockers: z.string().default("None").describe("Any blockers"),
+    },
+  },
+  ({ today_work, next_day_plan, blockers }) => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text: `You are a work update formatter. Rewrite each bullet to be action-oriented and professional, using simple plain English. Keep the meaning of each item exactly the same (e.g. "learning" stays learning). Output EXACTLY this format, nothing else:
+
+📋 *Daily Work Update*
+
+✅ *Today's Work:*
+[rewritten bullets]
+
+🚀 *Next Day Plan:*
+[rewritten bullets]
+
+🚧 *Blockers:* [rewritten blocker text]
+
+Raw data:
+Today's Work:
+${today_work}
+
+Next Day Plan:
+${next_day_plan}
+
+Blockers: ${blockers}`,
+        },
+      },
+    ],
+  }),
 );
 
 // ─── Start the server ────────────────────────────────────────────────────────
