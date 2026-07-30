@@ -9,7 +9,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "dev": "DANGEROUSLY_OMIT_AUTH=true npx @modelcontextprotocol/inspector tsx --env-file=.env src/server.ts",
+    "dev": "DANGEROUSLY_OMIT_AUTH=true npx @modelcontextprotocol/inspector@latest tsx --env-file=.env src/server.ts",
     "start": "node dist/server.js",
     "client:connect": "tsx --env-file=.env src/client/01-connect.ts",
     "client:tools": "tsx --env-file=.env src/client/02-call-tool.ts",

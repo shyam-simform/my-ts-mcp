@@ -3,8 +3,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
-import { join, dirname } from "path";
+import { join, dirname, basename } from "path";
 import { fileURLToPath } from "url";
+import { execSync } from "child_process";
 import { config } from "dotenv";
 import Groq from "groq-sdk";
 
@@ -17,6 +18,7 @@ const TASKS_FILE = join(DATA_DIR, "tasks.json");
 const NOTES_FILE = join(DATA_DIR, "notes.json");
 const STANDUPS_FILE = join(DATA_DIR, "standups.json");
 const LEARNING_FILE = join(DATA_DIR, "learning.json");
+const COMPLETED_FEATURES_FILE = join(DATA_DIR, "completed-features.json");
 
 // ─── Helper: load / save JSON safely ────────────────────────────────────────
 function loadJson<T>(path: string, fallback: T): T {
@@ -27,6 +29,21 @@ function loadJson<T>(path: string, fallback: T): T {
 function saveJson(path: string, data: unknown): void {
   mkdirSync(DATA_DIR, { recursive: true });
   writeFileSync(path, JSON.stringify(data, null, 2));
+}
+
+// ─── Helper: detect current repo/project name from cwd ─────────────────────
+function detectProjectName(): string {
+  try {
+    const topLevel = execSync("git rev-parse --show-toplevel", {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+    return basename(topLevel);
+  } catch {
+    return basename(process.cwd());
+  }
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -57,6 +74,13 @@ interface Standup {
   todayWork: string[];
   nextDayPlan: string[];
   blockers: string;
+  createdAt: string;
+}
+interface CompletedFeature {
+  id: number;
+  date: string;
+  summary: string;
+  project?: string;
   createdAt: string;
 }
 
@@ -419,6 +443,19 @@ server.tool(
     const todayWorkList = entry.todayWork.map((t: string) => `• ${t}`).join("\n");
     const nextDayPlanList = entry.nextDayPlan.map((t: string) => `• ${t}`).join("\n");
 
+    const completedFeatures = loadJson<CompletedFeature[]>(COMPLETED_FEATURES_FILE, []).filter(
+      (f) => f.date === target,
+    );
+    const completedFeaturesList = completedFeatures
+      .map((f) => `• ${f.project ? `[${f.project}] ` : ""}${f.summary}`)
+      .join("\n");
+    const completedFeaturesSection = completedFeatures.length
+      ? `\n\n🎯 *Completed Features:*\n[rewritten bullets here]`
+      : "";
+    const completedFeaturesRaw = completedFeatures.length
+      ? `\n\nCompleted Features:\n${completedFeaturesList}`
+      : "";
+
     const prompt = `You are a work update formatter. Your job is to rewrite each bullet point to be more action-oriented and professional, then output the result in EXACTLY this format — no extra text, no introduction, no commentary, nothing else:
 
 📋 *Daily Work Update — ${entry.date}*
@@ -429,13 +466,15 @@ server.tool(
 🚀 *Next Day Plan:*
 [rewritten bullets here]
 
-🚧 *Blockers:* [rewritten blocker text]
+🚧 *Blockers:* [rewritten blocker text]${completedFeaturesSection}
 
 💪 [one short motivational closing line]
 
 Rules:
 - Output ONLY the formatted work update. No preamble like "Here is your update:" or "Sure!".
 - Keep the exact section headers and emojis as shown above.
+- Only include the Completed Features section if completed features raw data is provided below.
+- Each section must contain ONLY items from its own raw data list below — never move, copy, or duplicate an item into a different section. Today's Work must have exactly the same number of bullets as the raw "Today's Work" list, Next Day Plan exactly the same number as the raw "Next Day Plan" list, and Completed Features (if present) exactly the same number as the raw "Completed Features" list. Do not invent new bullets in any section.
 - Use simple, plain English — avoid fancy words like "delved", "leveraged", "spearheaded", "synergized", "garnered", "elucidated". Write like a normal person talking to a colleague.
 - Each bullet must start with a simple action verb (e.g. "Learned", "Fixed", "Built", "Reviewed", "Added", "Tested").
 - NEVER change the meaning or nature of the task — if the input says "learning", keep it as learning (e.g. "Learned about X"), never replace it with "researched" or any other activity.
@@ -448,7 +487,7 @@ ${todayWorkList}
 Next Day Plan:
 ${nextDayPlanList}
 
-Blockers: ${entry.blockers}`;
+Blockers: ${entry.blockers}${completedFeaturesRaw}`;
 
     const aiResponse = await groq.chat.completions.create({
       model: "llama-3.1-8b-instant",
@@ -456,7 +495,7 @@ Blockers: ${entry.blockers}`;
       max_tokens: 1024,
       temperature: 0.3,
     });
-    const fallback = `📋 *Daily Work Update — ${entry.date}*\n\n✅ *Today's Work:*\n${todayWorkList}\n\n🚀 *Next Day Plan:*\n${nextDayPlanList}\n\n🚧 *Blockers:* ${entry.blockers}`;
+    const fallback = `📋 *Daily Work Update — ${entry.date}*\n\n✅ *Today's Work:*\n${todayWorkList}\n\n🚀 *Next Day Plan:*\n${nextDayPlanList}\n\n🚧 *Blockers:* ${entry.blockers}${completedFeatures.length ? `\n\n🎯 *Completed Features:*\n${completedFeaturesList}` : ""}`;
     const enhanced = aiResponse.choices[0]?.message?.content?.trim() || fallback;
 
     return {
@@ -863,6 +902,70 @@ server.tool(
 
     return {
       content: [{ type: "text", text: `Found ${matches.length} session(s) for "${query}":\n\n${lines.join("\n\n")}` }],
+    };
+  },
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOOL 14 — Log a completed feature/task
+// ════════════════════════════════════════════════════════════════════════════
+server.tool(
+  "log_completed_feature",
+  "Log a one-line summary of a feature or task you just finished, so it shows up in your end-of-day work update",
+  {
+    summary: z.string().min(1).describe("One-line summary of what was completed"),
+    project: z.string().min(1).optional().describe("Project/repo name this feature belongs to — auto-detected from the current repo if omitted"),
+    date: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be in YYYY-MM-DD format")
+      .optional()
+      .describe("Date in YYYY-MM-DD format (default: today)"),
+  },
+  async ({ summary, project, date: inputDate }) => {
+    const entries = loadJson<CompletedFeature[]>(COMPLETED_FEATURES_FILE, []);
+    const date = inputDate ?? new Date().toISOString().slice(0, 10);
+    const entry: CompletedFeature = {
+      id: Date.now(),
+      date,
+      summary,
+      project: project ?? detectProjectName(),
+      createdAt: new Date().toISOString(),
+    };
+    entries.push(entry);
+    saveJson(COMPLETED_FEATURES_FILE, entries);
+    return {
+      content: [{ type: "text", text: `✅ Logged completed feature: "${summary}" (${entry.project})` }],
+    };
+  },
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// TOOL 15 — List completed features for a day
+// ════════════════════════════════════════════════════════════════════════════
+server.tool(
+  "list_completed_features",
+  "List the features/tasks you've logged as completed for today or a specific date",
+  {
+    date: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .optional()
+      .describe("Date in YYYY-MM-DD format (default: today)"),
+  },
+  async ({ date }) => {
+    const target = date ?? new Date().toISOString().slice(0, 10);
+    const entries = loadJson<CompletedFeature[]>(COMPLETED_FEATURES_FILE, []);
+    const dayEntries = entries.filter((e) => e.date === target);
+
+    if (dayEntries.length === 0) {
+      return {
+        content: [{ type: "text", text: `No completed features logged for ${target}.` }],
+      };
+    }
+
+    const lines = dayEntries.map((e) => `🎯 ${e.project ? `[${e.project}] ` : ""}${e.summary}`);
+    return {
+      content: [{ type: "text", text: `Completed features for ${target}:\n\n${lines.join("\n")}` }],
     };
   },
 );
